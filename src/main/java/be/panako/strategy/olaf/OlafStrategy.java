@@ -558,6 +558,16 @@ public class OlafStrategy extends Strategy {
 	}
 
 	@Override
+	public byte[] extract(String resource) {
+		throw new RuntimeException("extract is currently not implemented for the Olaf strategy");
+	}
+
+	@Override
+	public void queryFingerprints(byte[] blob, int maxNumberOfResults, Set<Integer> avoid, QueryResultHandler handler) {
+		throw new RuntimeException("queryFingerprints is currently not implemented for the Olaf strategy");
+	}
+
+	@Override
 	public void monitor(String query, int maxNumberOfResults, Set<Integer> avoid, QueryResultHandler handler) {
 		int overlapInSeconds = Config.getInt(Key.MONITOR_OVERLAP); // 5
 		int stepSizeInSeconds = Config.getInt(Key.MONITOR_STEP_SIZE); //25

@@ -217,6 +217,16 @@ public class PitchClassHistogramStrategy extends Strategy {
 	}
 
 	@Override
+	public byte[] extract(String resource) {
+		throw new RuntimeException("extract is currently not implemented for the PCH strategy");
+	}
+
+	@Override
+	public void queryFingerprints(byte[] blob, int maxNumberOfResults, Set<Integer> avoid, QueryResultHandler handler) {
+		throw new RuntimeException("queryFingerprints is currently not implemented for the PCH strategy");
+	}
+
+	@Override
 	public void monitor(String query, int maxNumberOfReqults,Set<Integer> avoid,
 			QueryResultHandler handler) {
 		throw new Error("Operation not supported");

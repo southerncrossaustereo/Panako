@@ -8,7 +8,7 @@ plugins {
 }
 
 group 'be.panako'
-version '2.1'
+version '2.1-sca1'
 
 sourceCompatibility = 1.11
 targetCompatibility = 1.11
@@ -95,7 +95,7 @@ publishing {
 
         maven {
             name = "GitHubPackages"
-            url = "https://maven.pkg.github.com/JorenSix/Panako"
+            url = "https://maven.pkg.github.com/southerncrossaustereo/Panako"
             credentials {
                 username = System.getenv("GITHUB_ACTOR")
                 password = System.getenv("GITHUB_TOKEN")

@@ -1,0 +1,36 @@
+# Publish Panako to GitHub Packages on tag push.
+#
+# Tags that start with `v` (e.g. `v2.1-sca1`) trigger a publish run. The
+# version in build.gradle is the source of truth — make sure it matches the
+# tag before pushing. Also runnable manually via workflow_dispatch.
+name: Publish Panako to GitHub Packages
+
+on:
+  push:
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: Publish to GitHub Packages
+        uses: gradle/gradle-build-action@v3
+        with:
+          arguments: publishMavenJavaPublicationToGitHubPackagesRepository
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

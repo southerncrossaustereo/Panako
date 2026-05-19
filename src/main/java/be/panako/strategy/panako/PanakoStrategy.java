@@ -297,7 +297,22 @@ public class PanakoStrategy extends Strategy {
 			queryPath = query;
 			prints = toFingerprints(query);
 		}
-		
+
+		lookupFingerprints(queryPath, prints, maxNumberOfResults, avoid, handler);
+	}
+
+	@Override
+	public byte[] extract(String resource) {
+		return PanakoFingerprintCodec.encode(toFingerprints(resource));
+	}
+
+	@Override
+	public void queryFingerprints(byte[] blob, int maxNumberOfResults, Set<Integer> avoid, QueryResultHandler handler) {
+		List<PanakoFingerprint> prints = PanakoFingerprintCodec.decode(blob);
+		lookupFingerprints("<fingerprint-blob>", prints, maxNumberOfResults, avoid, handler);
+	}
+
+	protected void lookupFingerprints(String queryPath, List<PanakoFingerprint> prints, int maxNumberOfResults, Set<Integer> avoid, QueryResultHandler handler) {
 		PanakoStorage db = getStorage();
 		
 		Map<Long,PanakoFingerprint> printMap = new HashMap<>();

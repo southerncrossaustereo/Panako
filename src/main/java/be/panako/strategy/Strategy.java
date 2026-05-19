@@ -111,7 +111,28 @@ public abstract class Strategy {
 	 * Print some storage statistics.
 	 */
 	public abstract void printStorageStatistics();
-	
+
+	/**
+	 * Extract fingerprints from an audio resource and serialize them to a byte array.
+	 * The blob is intended for transport to a separate {@link #queryFingerprints} caller
+	 * so the audio does not need to be decoded and analysed more than once when the same
+	 * recording is matched against multiple storage backends.
+	 * @param resource The path name of the audio resource.
+	 * @return A serialized fingerprint blob whose format is defined by the implementing strategy.
+	 */
+	public abstract byte[] extract(String resource);
+
+	/**
+	 * Look up previously-extracted fingerprints in this strategy's storage and emit any
+	 * matches via the supplied handler. The {@code blob} argument must have been produced
+	 * by an {@link #extract} call on the same strategy and format version.
+	 * @param blob The serialized fingerprint blob.
+	 * @param maxNumberOfResults The maximum results to return.
+	 * @param avoid A set of identifiers to ignore in the result set.
+	 * @param handler A handler to process the results.
+	 */
+	public abstract void queryFingerprints(byte[] blob, int maxNumberOfResults, Set<Integer> avoid, QueryResultHandler handler);
+
 
 	private static Strategy strategy;
 
