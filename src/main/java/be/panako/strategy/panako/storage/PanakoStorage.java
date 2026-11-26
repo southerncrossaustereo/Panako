@@ -115,6 +115,22 @@ public interface PanakoStorage {
 	void processQueryQueue(Map<Long,List<PanakoHit>> matchAccumulator,int range,Set<Integer> resourcesToAvoid);
 
 	/**
+	 * Query each fingerprint hash in the queue and stream every hit to {@code consumer}, in the
+	 * same order the map-based variant would append them. The default implementation goes
+	 * through the map-based variant; storages with large indexes should override it to avoid
+	 * allocating an object per hit.
+	 * @param consumer Receives each hit
+	 * @param range The range determines how many hashes are allowed to differ
+	 * @param resourcesToAvoid The resource identifiers to leave out of the hits
+	 */
+	default void processQueryQueue(PanakoHitConsumer consumer,int range,Set<Integer> resourcesToAvoid) {
+		Map<Long,List<PanakoHit>> matchAccumulator = new java.util.HashMap<>();
+		processQueryQueue(matchAccumulator, range, resourcesToAvoid);
+		matchAccumulator.forEach((originalHash, hits) -> hits.forEach(h ->
+			consumer.accept(h.originalHash, h.matchedNearHash, h.t, h.resourceID, h.f)));
+	}
+
+	/**
 	 * Removes a fingerprint from the database. Similar to the store operation this is done in batches.
 	 * @param fingerprintHash The hash to delete
 	 * @param resourceIdentifier The resource id to remove

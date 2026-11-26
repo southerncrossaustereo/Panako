@@ -312,7 +312,12 @@ public class PanakoStrategy extends Strategy {
 		lookupFingerprints("<fingerprint-blob>", prints, maxNumberOfResults, avoid, handler);
 	}
 
-	protected void lookupFingerprints(String queryPath, List<PanakoFingerprint> prints, int maxNumberOfResults, Set<Integer> avoid, QueryResultHandler handler) {
+	/**
+	 * Original object-per-hit implementation of {@link #lookupFingerprints}. Retained only so
+	 * tests can check the streaming implementation returns the same results; do not call it
+	 * from production code.
+	 */
+	void lookupFingerprintsLegacy(String queryPath, List<PanakoFingerprint> prints, int maxNumberOfResults, Set<Integer> avoid, QueryResultHandler handler) {
 		PanakoStorage db = getStorage();
 		
 		Map<Long,PanakoFingerprint> printMap = new HashMap<>();
@@ -510,6 +515,227 @@ public class PanakoStrategy extends Strategy {
 		 }
 	}
 	
+	/**
+	 * Per-reference hit store: four parallel primitive arrays instead of a {@link PanakoHit}
+	 * plus a {@link PanakoMatch} object per hit. A five-minute query against a large index
+	 * produces millions of hits, so this is the difference between ~16 and ~100+ bytes of
+	 * heap per hit.
+	 */
+	static final class HitBuffer {
+		int size;
+		int[] queryTime = new int[8];
+		int[] matchTime = new int[8];
+		int[] queryF1 = new int[8];
+		int[] matchF1 = new int[8];
+
+		void add(int qt, int mt, int qf, int mf) {
+			if (size == queryTime.length) {
+				int cap = size * 2;
+				queryTime = java.util.Arrays.copyOf(queryTime, cap);
+				matchTime = java.util.Arrays.copyOf(matchTime, cap);
+				queryF1 = java.util.Arrays.copyOf(queryF1, cap);
+				matchF1 = java.util.Arrays.copyOf(matchF1, cap);
+			}
+			queryTime[size] = qt;
+			matchTime[size] = mt;
+			queryF1[size] = qf;
+			matchF1[size] = mf;
+			size++;
+		}
+
+		int deltaT(int i) {
+			return matchTime[i] - queryTime[i];
+		}
+
+		/** Reorders the hits by query time; ties keep insertion order (a stable sort). */
+		void sortByQueryTime() {
+			long[] keys = new long[size];
+			for (int i = 0; i < size; i++) {
+				// queryTime is a non-negative block index, so it sorts correctly in the high word
+				keys[i] = ((long) queryTime[i] << 32) | i;
+			}
+			java.util.Arrays.sort(keys);
+			int[] qt = new int[size], mt = new int[size], qf = new int[size], mf = new int[size];
+			for (int i = 0; i < size; i++) {
+				int from = (int) keys[i];
+				qt[i] = queryTime[from];
+				mt[i] = matchTime[from];
+				qf[i] = queryF1[from];
+				mf[i] = matchF1[from];
+			}
+			queryTime = qt; matchTime = mt; queryF1 = qf; matchF1 = mf;
+		}
+	}
+
+	/** Same as {@link #mostCommonDeltaTforHitList} over hits {@code [from, to)} of a buffer. */
+	private static int mostCommonDeltaT(HitBuffer hits, int from, int to) {
+		Map<Integer,Integer> countPerDiff = new HashMap<>();
+		for (int i = from; i < to; i++) {
+			countPerDiff.merge(hits.deltaT(i), 1, Integer::sum);
+		}
+		int maxCount = 0;
+		int mostCommonDeltaT = 0;
+		for (Map.Entry<Integer,Integer> entry : countPerDiff.entrySet()) {
+			if (entry.getValue() > maxCount) {
+				maxCount = entry.getValue();
+				mostCommonDeltaT = entry.getKey();
+			}
+		}
+		return mostCommonDeltaT;
+	}
+
+	/**
+	 * Looks the query prints up and reports the best-aligned references. Same algorithm and
+	 * thresholds as {@link #lookupFingerprintsLegacy}, but hits stream from the storage straight
+	 * into a {@link HitBuffer} per reference, so peak heap is a small fraction of the original.
+	 * The one behavioural difference: hits sharing a query time are ordered by arrival rather
+	 * than by hash-map iteration order, which can only move a tie inside the first/last hit
+	 * windows used to estimate the alignment.
+	 */
+	protected void lookupFingerprints(String queryPath, List<PanakoFingerprint> prints, int maxNumberOfResults, Set<Integer> avoid, QueryResultHandler handler) {
+		PanakoStorage db = getStorage();
+
+		Map<Long,PanakoFingerprint> printMap = new HashMap<>();
+		for(PanakoFingerprint print : prints) {
+			long hash = print.hash();
+			db.addToQueryQueue(hash);
+			printMap.put(hash, print);
+		}
+
+		StopWatch w = new StopWatch();
+		int queryRange = Config.getInt(Key.PANAKO_QUERY_RANGE);
+
+		final Map<Integer,HitBuffer> hitsPerIdentifier = new HashMap<>();
+		final long[] totalHits = {0};
+		// Hits for one query hash arrive together, so cache its print instead of a map lookup per hit.
+		final long[] lastHash = {0};
+		final PanakoFingerprint[] lastPrint = {null};
+		db.processQueryQueue((originalHash, matchedNearHash, t, resourceID, f) -> {
+			if (lastPrint[0] == null || lastHash[0] != originalHash) {
+				lastHash[0] = originalHash;
+				lastPrint[0] = printMap.get(originalHash);
+			}
+			hitsPerIdentifier.computeIfAbsent(resourceID, k -> new HitBuffer())
+				.add(lastPrint[0].t1, t, lastPrint[0].f1, f);
+			totalHits[0]++;
+		}, queryRange, avoid);
+
+		LOG.info(String.format("Query for %d prints, %d hits over %d references in %s \n", printMap.size(), totalHits[0], hitsPerIdentifier.size(), w.formattedToString()));
+
+		int minimumUnfilteredHits = Config.getInt(Key.PANAKO_MIN_HITS_UNFILTERED);
+		int minimumFilteredHits = Config.getInt(Key.PANAKO_MIN_HITS_FILTERED);
+		int maxPartListSize = Config.getInt(Key.PANAKO_HIT_PART_MAX_SIZE);
+		int partDivider = Config.getInt(Key.PANAKO_HIT_PART_DIVIDER);
+		double threshold = Config.getFloat(Key.PANAKO_QUERY_RANGE);
+		float minTimeFactor = Config.getFloat(Key.PANAKO_MIN_TIME_FACTOR);
+		float maxTimeFactor = Config.getFloat(Key.PANAKO_MAX_TIME_FACTOR);
+		float minFreqFactor = Config.getFloat(Key.PANAKO_MIN_FREQ_FACTOR);
+		float maxFreqFactor = Config.getFloat(Key.PANAKO_MAX_FREQ_FACTOR);
+		float minDuration = Config.getFloat(Key.PANAKO_MIN_MATCH_DURATION);
+		float minSecWithMatch = Config.getFloat(Key.PANAKO_MIN_SEC_WITH_MATCH);
+
+		final List<QueryResult> queryResults = new ArrayList<>();
+
+		for (Map.Entry<Integer,HitBuffer> entry : hitsPerIdentifier.entrySet()) {
+			int identifier = entry.getKey();
+			HitBuffer hits = entry.getValue();
+			int n = hits.size;
+			if (n < minimumUnfilteredHits)
+				continue;
+
+			hits.sortByQueryTime();
+
+			//view the first and last hits (max 250)
+			int partListLength = Math.min(maxPartListSize, Math.max(minimumUnfilteredHits, n / partDivider));
+
+			//find the first x1 where delta t is equals to the most common delta t
+			float y1 = mostCommonDeltaT(hits, 0, partListLength);
+			float x1 = 0;
+			float frequencyFactor = 0;
+			for (int i = 0; i < partListLength; i++) {
+				if (hits.deltaT(i) == y1) {
+					x1 = hits.queryTime[i];
+					frequencyFactor = binToHz(hits.matchF1[i]) / binToHz(hits.queryF1[i]);
+					break;
+				}
+			}
+
+			//find the last x2 where delta t is equals to the most common delta t
+			float y2 = mostCommonDeltaT(hits, n - partListLength, n);
+			float x2 = 0;
+			for (int i = n - 1; i >= n - partListLength; i--) {
+				if (hits.deltaT(i) == y2) {
+					x2 = hits.queryTime[i];
+					break;
+				}
+			}
+
+			float slope = (y2-y1)/(x2-x1);
+			float offset = -x1 * slope + y1;
+			float timeFactor = 1.0f/(1-slope);
+
+			//only continue processing when time factor is reasonable
+			if (!(timeFactor > minTimeFactor && timeFactor < maxTimeFactor &&
+					frequencyFactor > minFreqFactor && frequencyFactor < maxFreqFactor))
+				continue;
+
+			// indices of hits within the expected range of the alignment line, in query-time order
+			int[] kept = new int[n];
+			int filtered = 0;
+			for (int i = 0; i < n; i++) {
+				float yActual = hits.deltaT(i);
+				float yPredicted = slope * hits.queryTime[i] + offset;
+				if (Math.abs(yActual-yPredicted) <= threshold)
+					kept[filtered++] = i;
+			}
+
+			//ignore resources with too few filtered hits remaining
+			if (filtered <= minimumFilteredHits)
+				continue;
+
+			int first = kept[0];
+			int last = kept[filtered - 1];
+			float queryStart = blocksToSeconds(hits.queryTime[first]);
+			float queryStop = blocksToSeconds(hits.queryTime[last]);
+			if (queryStop - queryStart < minDuration)
+				continue;
+
+			int score = filtered;
+			float refStart = blocksToSeconds(hits.matchTime[first]);
+			float refStop = blocksToSeconds(hits.matchTime[last]);
+
+			//count the seconds of the reference that hold at least one aligned hit
+			java.util.Set<Integer> secondsWithMatches = new java.util.HashSet<>();
+			for (int k = 0; k < filtered; k++) {
+				float offsetInSec = blocksToSeconds(hits.matchTime[kept[k]]) - refStart;
+				secondsWithMatches.add((int) offsetInSec);
+			}
+			float numberOfMatchingSeconds = (float) Math.ceil(refStop - refStart);
+			float emptySeconds = numberOfMatchingSeconds - secondsWithMatches.size();
+			float percentOfSecondsWithMatches = 1 - (emptySeconds / numberOfMatchingSeconds);
+
+			if (percentOfSecondsWithMatches >= minSecWithMatch) {
+				PanakoResourceMetadata metadata = db.getMetadata((long) identifier);
+				String refPath = metadata != null ? metadata.path : "metadata unavailable!";
+				queryResults.add(new QueryResult(queryPath, queryStart, queryStop, refPath, "" + identifier, refStart, refStop, score, timeFactor, frequencyFactor, percentOfSecondsWithMatches));
+			}
+		}
+
+		if (queryResults.isEmpty()) {
+			handler.handleEmptyResult(QueryResult.emptyQueryResult(queryPath,0,0));
+		} else {
+			//sort results by score desc
+			queryResults.sort((QueryResult a, QueryResult b) -> Integer.valueOf((int) b.score).compareTo(Integer.valueOf((int) a.score)));
+			List<QueryResult> finalResults = queryResults;
+			if (queryResults.size() > maxNumberOfResults) {
+				finalResults = queryResults.subList(0, maxNumberOfResults);
+			}
+			for (QueryResult r : finalResults) {
+				handler.handleQueryResult(r);
+			}
+		}
+	}
+
 	@Override
 	public void monitor(String query, int maxNumberOfReqults, Set<Integer> avoid, QueryResultHandler handler) {
 		int overlapInSeconds = Config.getInt(Key.MONITOR_OVERLAP); // 5

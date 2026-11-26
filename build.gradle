@@ -8,7 +8,7 @@ plugins {
 }
 
 group 'be.panako'
-version '2.1-sca1'
+version '2.1-sca2'
 
 sourceCompatibility = 1.11
 targetCompatibility = 1.11
