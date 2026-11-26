@@ -127,7 +127,8 @@ public class PanakoStorageKV implements PanakoStorage{
 		
 		storeQueue = new HashMap<Long,List<long[]>>();
 		deleteQueue = new HashMap<Long,List<long[]>>();
-		queryQueue = new HashMap<Long,List<Long>>();
+		// Concurrent: lookups on different threads add and remove their own entries at the same time.
+		queryQueue = new java.util.concurrent.ConcurrentHashMap<Long,List<Long>>();
 	}
 
 	/**
@@ -278,10 +279,7 @@ public class PanakoStorageKV implements PanakoStorage{
 
 	@Override
 	public void addToQueryQueue(long queryHash) {
-		long threadID = Thread.currentThread().getId();
-		if(!queryQueue.containsKey(threadID))
-			queryQueue.put(threadID, new ArrayList<Long>());
-		queryQueue.get(threadID).add(queryHash);
+		queryQueue.computeIfAbsent(Thread.currentThread().getId(), k -> new ArrayList<Long>()).add(queryHash);
 	}
 
 	@Override
@@ -291,17 +289,20 @@ public class PanakoStorageKV implements PanakoStorage{
 
 	@Override
 	public void processQueryQueue(Map<Long,List<PanakoHit>> matchAccumulator,int range,Set<Integer> resourcesToAvoid) {
+		processQueryQueue((originalKey, fingerprintHash, t, resourceID, f) -> {
+			if(!matchAccumulator.containsKey(originalKey))
+				matchAccumulator.put(originalKey,new ArrayList<PanakoHit>());
+			matchAccumulator.get(originalKey).add(new PanakoHit(originalKey, fingerprintHash, t, resourceID, f));
+		}, range, resourcesToAvoid);
+	}
+
+	@Override
+	public void processQueryQueue(PanakoHitConsumer consumer,int range,Set<Integer> resourcesToAvoid) {
 		
-		if (queryQueue.isEmpty())
-			return;
-		
-		long threadID = Thread.currentThread().getId();
-		if(!queryQueue.containsKey(threadID))
-			return;
-		
-		List<Long> queue = queryQueue.get(threadID);
-		
-		if (queue.isEmpty())
+		// Take this thread's queue out of the shared map: concurrent lookups each own their queue,
+		// and removing it stops one entry per (pooled, recycled) thread accumulating forever.
+		List<Long> queue = queryQueue.remove(Thread.currentThread().getId());
+		if (queue == null || queue.isEmpty())
 			return;
 		
 		try (Txn<ByteBuffer> txn = env.txnRead()) {
@@ -327,9 +328,7 @@ public class PanakoStorageKV implements PanakoStorage{
 				      
 				      if(fingerprintHash <= stopKey) {
 				    	  if(!resourcesToAvoid.contains((int) resourceID)) {
-				    		  if(!matchAccumulator.containsKey(originalKey))
-				    			  matchAccumulator.put(originalKey,new ArrayList<PanakoHit>());
-				    		  matchAccumulator.get(originalKey).add(new PanakoHit(originalKey, fingerprintHash, t, resourceID, f));
+				    		  consumer.accept(originalKey, fingerprintHash, (int) t, (int) resourceID, (int) f);
 				    	  }
 				   
 					      while(true) {
@@ -341,9 +340,7 @@ public class PanakoStorageKV implements PanakoStorage{
 							      //System.out.printf("Dup Hash: %d id %d t1 %d\n",fingerprintHash , resourceID,t);
 							      
 							      if(!resourcesToAvoid.contains((int) resourceID)) {
-						    		  if(!matchAccumulator.containsKey(originalKey))
-						    			  matchAccumulator.put(originalKey,new ArrayList<PanakoHit>());
-						    		  matchAccumulator.get(originalKey).add(new PanakoHit(originalKey, fingerprintHash, t, resourceID,f));
+						    		  consumer.accept(originalKey, fingerprintHash, (int) t, (int) resourceID, (int) f);
 						    	  }
 						      }
 						      
@@ -359,9 +356,7 @@ public class PanakoStorageKV implements PanakoStorage{
 							      
 							      
 							      if(!resourcesToAvoid.contains((int) resourceID)) {
-						    		  if(!matchAccumulator.containsKey(originalKey))
-						    			  matchAccumulator.put(originalKey,new ArrayList<PanakoHit>());
-						    		  matchAccumulator.get(originalKey).add(new PanakoHit(originalKey, fingerprintHash, t, resourceID,f));
+						    		  consumer.accept(originalKey, fingerprintHash, (int) t, (int) resourceID, (int) f);
 						    	  }
 						      } else {
 						    	  //no next found, end of db
@@ -373,7 +368,7 @@ public class PanakoStorageKV implements PanakoStorage{
 		      }
 		      c.close();
 		      txn.commit();
-		      queue.clear();
+		      // queue was removed from queryQueue above; nothing to clear
 		}
 		
 	}
